@@ -16,6 +16,25 @@ cargo build --release
 
 选项: `--all`(含离线节点)、`--concurrency N`、`--timeout SECS`、`--cidr CIDR`(可重复)。
 
+## 依赖：`rex` 自动发现
+
+握手和 `add` 都需要本机有 `rex` CLI。解析顺序：
+
+1. 环境变量 **`REX_BIN`**（若设置且可执行，直接用它）
+2. **`PATH`** 里的 `rex`
+3. **macOS**：自动在 app 包内探测
+   - `/Applications/Rex*.app/Contents/Helpers/*.rex/Contents/MacOS/rex`
+   - `$HOME/Applications/Rex*.app/...`（同样路径）
+4. 都找不到才报错，并提示安装或设置 `REX_BIN`
+
+所以装了 Rex.app / Rex Beta.app 的 Mac 不必再手动软链。需要覆盖时：
+
+```bash
+export REX_BIN="/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
+```
+
+`tailscale` 仍要求在 `PATH` 里（仅做 tailnet 扫描时）。
+
 ## 原理
 
 - **tailnet**: 读 `tailscale status --json` 拿节点,逐个 `rex -S <addr> ls` 真握手(443 和 7297 都试),输出含 `LABEL` 即判定活着。

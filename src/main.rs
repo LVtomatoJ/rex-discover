@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 use std::time::Duration;
@@ -135,8 +135,8 @@ async fn main() -> Result<()> {
     let handshake_timeout = Duration::from_secs(cli.timeout.max(1));
     let concurrency = cli.concurrency.max(1);
 
-    // `rex` is always required (handshake + add). `tailscale` only if we scan it.
-    ensure_bin_in_path("rex")?;
+    // `rex` is always required (handshake + add). Resolve via REX_BIN / PATH / macOS app.
+    let rex_bin = resolve_rex_bin()?;
     let do_tailnet = !cli.lan_only;
     let do_lan = !cli.tailnet_only;
     if do_tailnet {
@@ -145,13 +145,13 @@ async fn main() -> Result<()> {
 
     let mut lives = Vec::new();
     if do_tailnet {
-        match discover_tailnet(cli.all, concurrency, handshake_timeout).await {
+        match discover_tailnet(cli.all, concurrency, handshake_timeout, &rex_bin).await {
             Ok(mut v) => lives.append(&mut v),
             Err(e) => eprintln!("tailnet scan failed: {e:#}"),
         }
     }
     if do_lan {
-        match discover_lan(&cli.cidrs, concurrency, handshake_timeout).await {
+        match discover_lan(&cli.cidrs, concurrency, handshake_timeout, &rex_bin).await {
             Ok(mut v) => lives.append(&mut v),
             Err(e) => eprintln!("lan scan failed: {e:#}"),
         }
@@ -176,29 +176,132 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Add { dry_run }) => {
-            add_hosts(&lives, dry_run, do_tailnet).await?;
+            add_hosts(&lives, dry_run, do_tailnet, &rex_bin).await?;
         }
     }
     Ok(())
 }
 
 fn ensure_bin_in_path(name: &str) -> Result<()> {
-    let found = std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let p: PathBuf = dir.join(name);
-                p.is_file()
-            })
-        })
-        .unwrap_or(false);
-    if !found {
+    if find_in_path(name).is_none() {
         bail!(
             "`{name}` not found in PATH. Install it first, then re-run rex-discover.\n\
              - tailscale: https://tailscale.com/download\n\
-             - rex:       your usual Rex CLI install"
+             - rex:       your usual Rex CLI install (or set REX_BIN)"
         );
     }
     Ok(())
+}
+
+/// Resolve the `rex` binary.
+///
+/// Order:
+/// 1. `REX_BIN` env var, if set and executable
+/// 2. `rex` on `PATH`
+/// 3. (macOS) inside `/Applications/Rex*.app` or `$HOME/Applications/Rex*.app`
+/// 4. error with install / `REX_BIN` hint
+fn resolve_rex_bin() -> Result<PathBuf> {
+    if let Some(raw) = std::env::var_os("REX_BIN") {
+        let p = PathBuf::from(raw);
+        if is_executable(&p) {
+            return Ok(p);
+        }
+    }
+    if let Some(p) = find_in_path("rex") {
+        return Ok(p);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(p) = find_rex_in_macos_apps() {
+        return Ok(p);
+    }
+    bail!(
+        "`rex` not found in PATH. Install it first, then re-run rex-discover.\n\
+         - tailscale: https://tailscale.com/download\n\
+         - rex:       your usual Rex CLI install\n\
+         - or set REX_BIN to the rex executable (macOS app bundle path is auto-detected)"
+    );
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let p = dir.join(name);
+            if is_executable(&p) {
+                Some(p)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Look for `rex` inside Rex*.app bundles:
+/// `/Applications/Rex*.app/Contents/Helpers/*.rex/Contents/MacOS/rex`
+/// and the same under `$HOME/Applications`.
+#[cfg(target_os = "macos")]
+fn find_rex_in_macos_apps() -> Option<PathBuf> {
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Applications"));
+    }
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut apps: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("Rex") && n.ends_with(".app"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        apps.sort();
+        for app in apps {
+            let helpers = app.join("Contents").join("Helpers");
+            let Ok(helper_entries) = std::fs::read_dir(&helpers) else {
+                continue;
+            };
+            let mut bundles: Vec<PathBuf> = helper_entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.ends_with(".rex"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            bundles.sort();
+            for bundle in bundles {
+                let candidate = bundle.join("Contents").join("MacOS").join("rex");
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn dedupe_by_addr(lives: Vec<LiveRex>) -> Vec<LiveRex> {
@@ -218,6 +321,7 @@ async fn discover_tailnet(
     probe_all: bool,
     concurrency: usize,
     handshake_timeout: Duration,
+    rex_bin: &Path,
 ) -> Result<Vec<LiveRex>> {
     let status = fetch_tailscale_status().await?;
 
@@ -241,15 +345,19 @@ async fn discover_tailnet(
     );
 
     let results: Vec<Option<LiveRex>> = stream::iter(candidates.into_iter())
-        .map(|(name, dns)| async move {
-            probe_host_addrs(
-                Source::Tailnet,
-                name,
-                &format!("https://{dns}"),
-                &format!("http://{dns}:7297"),
-                handshake_timeout,
-            )
-            .await
+        .map(|(name, dns)| {
+            let rex_bin = rex_bin.to_path_buf();
+            async move {
+                probe_host_addrs(
+                    Source::Tailnet,
+                    name,
+                    &format!("https://{dns}"),
+                    &format!("http://{dns}:7297"),
+                    handshake_timeout,
+                    &rex_bin,
+                )
+                .await
+            }
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -305,6 +413,7 @@ async fn discover_lan(
     cidr_args: &[String],
     concurrency: usize,
     handshake_timeout: Duration,
+    rex_bin: &Path,
 ) -> Result<Vec<LiveRex>> {
     let nets = if cidr_args.is_empty() {
         detect_private_slash24s().await?
@@ -367,39 +476,42 @@ async fn discover_lan(
 
     // Phase 2: rex handshake only on open ports.
     let results: Vec<Option<LiveRex>> = stream::iter(open.into_iter())
-        .map(|(ip, ports)| async move {
-            let https = if ports.p443 {
-                Some(format!("https://{ip}"))
-            } else {
-                None
-            };
-            let http7297 = if ports.p7297 {
-                Some(format!("http://{ip}:7297"))
-            } else {
-                None
-            };
-            // Prefer 443 when both open.
-            if let Some(ref addr) = https {
-                if probe_rex(addr, handshake_timeout).await {
-                    return Some(LiveRex {
-                        source: Source::Lan,
-                        name: ip.to_string(),
-                        addr: addr.clone(),
-                        mode: "builtin-443",
-                    });
+        .map(|(ip, ports)| {
+            let rex_bin = rex_bin.to_path_buf();
+            async move {
+                let https = if ports.p443 {
+                    Some(format!("https://{ip}"))
+                } else {
+                    None
+                };
+                let http7297 = if ports.p7297 {
+                    Some(format!("http://{ip}:7297"))
+                } else {
+                    None
+                };
+                // Prefer 443 when both open.
+                if let Some(ref addr) = https {
+                    if probe_rex(&rex_bin, addr, handshake_timeout).await {
+                        return Some(LiveRex {
+                            source: Source::Lan,
+                            name: ip.to_string(),
+                            addr: addr.clone(),
+                            mode: "builtin-443",
+                        });
+                    }
                 }
-            }
-            if let Some(ref addr) = http7297 {
-                if probe_rex(addr, handshake_timeout).await {
-                    return Some(LiveRex {
-                        source: Source::Lan,
-                        name: ip.to_string(),
-                        addr: addr.clone(),
-                        mode: "7297",
-                    });
+                if let Some(ref addr) = http7297 {
+                    if probe_rex(&rex_bin, addr, handshake_timeout).await {
+                        return Some(LiveRex {
+                            source: Source::Lan,
+                            name: ip.to_string(),
+                            addr: addr.clone(),
+                            mode: "7297",
+                        });
+                    }
                 }
+                None
             }
-            None
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -445,11 +557,7 @@ async fn detect_private_slash24s() -> Result<Vec<Ipv4Net>> {
 }
 
 fn which_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-        })
-        .unwrap_or(false)
+    find_in_path(name).is_some()
 }
 
 async fn detect_via_ip_json() -> Result<Vec<Ipv4Net>> {
@@ -566,8 +674,9 @@ async fn probe_host_addrs(
     https: &str,
     http7297: &str,
     handshake_timeout: Duration,
+    rex_bin: &Path,
 ) -> Option<LiveRex> {
-    if probe_rex(https, handshake_timeout).await {
+    if probe_rex(rex_bin, https, handshake_timeout).await {
         return Some(LiveRex {
             source,
             name,
@@ -575,7 +684,7 @@ async fn probe_host_addrs(
             mode: "builtin-443",
         });
     }
-    if probe_rex(http7297, handshake_timeout).await {
+    if probe_rex(rex_bin, http7297, handshake_timeout).await {
         return Some(LiveRex {
             source,
             name,
@@ -587,9 +696,9 @@ async fn probe_host_addrs(
 }
 
 /// Real handshake: `rex -S <addr> ls` must print "LABEL".
-async fn probe_rex(addr: &str, handshake_timeout: Duration) -> bool {
+async fn probe_rex(rex_bin: &Path, addr: &str, handshake_timeout: Duration) -> bool {
     let fut = async {
-        let output = Command::new("rex")
+        let output = Command::new(rex_bin)
             .args(["-S", addr, "ls"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -681,7 +790,12 @@ fn lan_shortname(name_or_ip: &str) -> String {
     format!("lan-{}", name_or_ip.replace(['.', ':'], "-"))
 }
 
-async fn add_hosts(lives: &[LiveRex], dry_run: bool, have_tailscale: bool) -> Result<()> {
+async fn add_hosts(
+    lives: &[LiveRex],
+    dry_run: bool,
+    have_tailscale: bool,
+    rex_bin: &Path,
+) -> Result<()> {
     // Figure out Self short name so we don't add ourselves.
     let self_short = if have_tailscale {
         match fetch_tailscale_status().await {
@@ -716,14 +830,18 @@ async fn add_hosts(lives: &[LiveRex], dry_run: bool, have_tailscale: bool) -> Re
         }
 
         print!("add   {host_name} -> {} … ", l.addr);
-        let output = Command::new("rex")
+        let output = Command::new(rex_bin)
             .args(["hosts", "add", &host_name, &l.addr])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .await
             .with_context(|| {
-                format!("failed to spawn `rex hosts add {host_name} {}`", l.addr)
+                format!(
+                    "failed to spawn `{} hosts add {host_name} {}`",
+                    rex_bin.display(),
+                    l.addr
+                )
             })?;
 
         if output.status.success() {
@@ -746,4 +864,102 @@ async fn add_hosts(lives: &[LiveRex], dry_run: bool, have_tailscale: bool) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Env-mutating tests share one process PATH / REX_BIN — serialize them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn make_fake_bin(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+        }
+        p
+    }
+
+    fn temp_workdir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rex-discover-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_rex_bin_prefers_rex_bin_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_workdir("rex-bin");
+        let fake = make_fake_bin(&dir, "custom-rex");
+        let old_rex_bin = std::env::var_os("REX_BIN");
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("REX_BIN", &fake);
+        // Even with empty PATH, REX_BIN wins.
+        std::env::set_var("PATH", "");
+        let got = resolve_rex_bin().expect("REX_BIN should resolve");
+        assert_eq!(got, fake);
+        restore_env("REX_BIN", old_rex_bin);
+        restore_env("PATH", old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_rex_bin_finds_path_entry() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_workdir("path");
+        let fake = make_fake_bin(&dir, "rex");
+        let old_rex_bin = std::env::var_os("REX_BIN");
+        let old_path = std::env::var_os("PATH");
+        std::env::remove_var("REX_BIN");
+        std::env::set_var("PATH", &dir);
+        let got = resolve_rex_bin().expect("PATH rex should resolve");
+        assert_eq!(got, fake);
+        restore_env("REX_BIN", old_rex_bin);
+        restore_env("PATH", old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_rex_bin_errors_when_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_rex_bin = std::env::var_os("REX_BIN");
+        let old_path = std::env::var_os("PATH");
+        let old_home = std::env::var_os("HOME");
+        std::env::remove_var("REX_BIN");
+        // Empty PATH + empty HOME Applications so macOS probe also misses.
+        std::env::set_var("PATH", "");
+        let empty_home = temp_workdir("no-home-apps");
+        std::env::set_var("HOME", &empty_home);
+        let err = resolve_rex_bin().expect_err("should fail when rex is missing");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`rex` not found"), "msg={msg}");
+        assert!(msg.contains("REX_BIN"), "msg should hint REX_BIN: {msg}");
+        restore_env("REX_BIN", old_rex_bin);
+        restore_env("PATH", old_path);
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(&empty_home);
+    }
+
+    fn restore_env(key: &str, val: Option<std::ffi::OsString>) {
+        match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
 }
